@@ -2,8 +2,17 @@
 
 import DOMPurify from 'dompurify';
 import { marked, type Tokens } from 'marked';
+import {
+  formatTimestampWithRelative,
+  isSensitiveKeyOrValue,
+  MAX_SERVER_KNOWLEDGE,
+  MAX_SERVER_WORK_LOGS,
+  normalizeKnowledgeInput,
+  type UnifiedServerMemory,
+} from '../../../src/server-memory-schema';
 import { copyTextToClipboard } from '../clipboard';
 import { getLocale, onLocaleChange, t, translateDocument } from '../i18n';
+import { confirmAction, notify } from '../ui-feedback';
 import { getTerminalFillCommand, normalizeCodeLanguage } from './code-actions';
 import {
   buildTerminalSelectionMessage,
@@ -89,10 +98,34 @@ export class AgentPanel {
     previousFocus: HTMLElement | null;
   } | null = null;
 
+  // Unified Server Memory state (Work Logs & Knowledge)
+  private isMemoryDrawerOpen: boolean = false;
+  private activeMemoryTab: 'workLog' | 'knowledge' = 'workLog';
+  private unifiedMemory: UnifiedServerMemory = { workLogs: [], knowledge: [] };
+  private memoryDrawerEl: HTMLElement | null = null;
+  private memoryTabWorkLogBtn: HTMLElement | null = null;
+  private memoryTabKnowledgeBtn: HTMLElement | null = null;
+  private memoryContentEl: HTMLElement | null = null;
+  private memoryCountEl: HTMLElement | null = null;
+  private memoryAddBtn: HTMLElement | null = null;
+  private memoryAddFormContainerEl: HTMLElement | null = null;
+  private revealedSecretIds: Set<number> = new Set();
+
   constructor(
     private parentEl: HTMLElement,
-    private isLoggedIn: boolean
+    private isLoggedIn: boolean,
+    private serverId?: number
   ) {}
+
+  setServerId(serverId?: number): void {
+    this.serverId = serverId;
+    this.revealedSecretIds.clear();
+    if (this.isMemoryDrawerOpen) {
+      void this.fetchServerMemory();
+    } else if (this.isVisible && this.serverId) {
+      void this.fetchServerMemory();
+    }
+  }
 
   setLayoutChangeHandler(handler: () => void): void {
     this.onLayoutChange = handler;
@@ -116,7 +149,7 @@ export class AgentPanel {
     this.panelEl = document.createElement('div');
     this.panelEl.id = 'agent-panel';
     this.panelEl.className =
-      'shrink-0 border-l border-[var(--border)] flex flex-col bg-[var(--bg)] overflow-hidden h-full';
+      'shrink-0 border-l border-[var(--border)] flex flex-col bg-[var(--bg)] overflow-hidden h-full relative';
     this.panelEl.style.width = 'min(clamp(420px, 40vw, 600px), 100%)';
     this.panelEl.style.display = 'none';
 
@@ -127,11 +160,40 @@ export class AgentPanel {
           <span class="material-symbols-outlined text-[var(--accent-secondary)]" style="font-size: 18px; font-variation-settings: 'FILL' 1;">smart_toy</span>
           <span class="text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)] truncate" data-i18n="agent.title">AI Agent 助手</span>
         </div>
-        <button id="agent-close-btn" class="agent-close-button text-muted hover:text-primary transition-colors cursor-pointer p-1" data-i18n-title="agent.backToTerminal" data-i18n-aria-label="agent.backToTerminal" title="返回终端" aria-label="返回终端">
-          <span class="agent-mobile-back material-symbols-outlined" style="font-size:18px;" aria-hidden="true">arrow_back</span>
-          <span class="agent-mobile-back agent-back-label" data-i18n="agent.backToTerminal">返回终端</span>
-          <span class="agent-desktop-close material-symbols-outlined" style="font-size:18px;" aria-hidden="true">close</span>
-        </button>
+        <div class="flex items-center gap-1">
+          <button id="agent-memory-btn" class="agent-header-btn text-muted hover:text-primary transition-colors cursor-pointer p-1 rounded hover:bg-[var(--bg-hover)] flex items-center justify-center" data-i18n-title="agent.memoryTitle" title="工作备忘与记忆" aria-label="工作备忘与记忆">
+            <span class="material-symbols-outlined" style="font-size:18px;" aria-hidden="true">history_edu</span>
+          </button>
+          <button id="agent-close-btn" class="agent-close-button text-muted hover:text-primary transition-colors cursor-pointer p-1" data-i18n-title="agent.backToTerminal" data-i18n-aria-label="agent.backToTerminal" title="返回终端" aria-label="返回终端">
+            <span class="agent-mobile-back material-symbols-outlined" style="font-size:18px;" aria-hidden="true">arrow_back</span>
+            <span class="agent-mobile-back agent-back-label" data-i18n="agent.backToTerminal">返回终端</span>
+            <span class="agent-desktop-close material-symbols-outlined" style="font-size:18px;" aria-hidden="true">close</span>
+          </button>
+        </div>
+      </div>
+      <div id="agent-memory-drawer" class="agent-memory-drawer hidden flex flex-col bg-[var(--bg)] absolute inset-x-0 top-12 bottom-0 z-20 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-elevated)] shrink-0">
+          <div class="flex items-center gap-1.5 min-w-0">
+            <span class="material-symbols-outlined text-[var(--accent-secondary)]" style="font-size: 16px;">history_edu</span>
+            <span class="text-xs font-bold text-primary truncate" data-i18n="agent.memoryHeader">工作备忘与记忆</span>
+            <span id="agent-memory-count" class="text-[11px] text-muted font-code shrink-0"></span>
+          </div>
+          <div class="flex items-center gap-1 shrink-0">
+            <button id="agent-memory-add-btn" type="button" class="hidden text-[11px] px-2 py-0.5 rounded border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)]/10 transition-colors flex items-center gap-1 cursor-pointer">
+              <span class="material-symbols-outlined text-[13px]">add</span>
+              <span data-i18n="agent.addKnowledge">添加备忘</span>
+            </button>
+            <button id="agent-memory-close-btn" type="button" class="text-muted hover:text-primary p-1 cursor-pointer" data-i18n-title="agent.close" title="关闭">
+              <span class="material-symbols-outlined text-[16px]">close</span>
+            </button>
+          </div>
+        </div>
+        <div class="flex border-b border-[var(--border)] bg-[var(--bg-elevated)]/50 shrink-0 text-xs">
+          <button id="agent-tab-work-log" type="button" class="flex-1 py-1.5 text-center font-medium border-b-2 border-[var(--accent)] text-[var(--accent)] transition-colors cursor-pointer" data-i18n="agent.tabWorkLog">工作历程</button>
+          <button id="agent-tab-knowledge" type="button" class="flex-1 py-1.5 text-center font-medium border-b-2 border-transparent text-muted hover:text-primary transition-colors cursor-pointer" data-i18n="agent.tabKnowledge">知识与凭据</button>
+        </div>
+        <div id="agent-memory-add-form" class="hidden p-3 border-b border-[var(--border)] bg-[var(--bg-elevated)] shrink-0"></div>
+        <div id="agent-memory-content" class="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar text-[12px]"></div>
       </div>
       <div id="agent-messages" class="flex-1 overflow-y-auto px-4 py-3 space-y-3 custom-scrollbar text-[13px]"></div>
       <div class="agent-panel-composer px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-elevated)]">
@@ -171,6 +233,9 @@ export class AgentPanel {
       this.updateInputState();
       this.renderTerminalSelectionContext();
       this.refreshCodeBlockActions();
+      if (this.isMemoryDrawerOpen) {
+        this.renderMemoryContent();
+      }
     });
 
     this.parentEl.appendChild(this.panelEl);
@@ -178,12 +243,24 @@ export class AgentPanel {
     this.contextEl = this.panelEl.querySelector('#agent-context');
     this.inputEl = this.panelEl.querySelector('#agent-input') as HTMLTextAreaElement;
     this.sendBtn = this.panelEl.querySelector('#agent-send-btn');
+    this.memoryDrawerEl = this.panelEl.querySelector('#agent-memory-drawer');
+    this.memoryTabWorkLogBtn = this.panelEl.querySelector('#agent-tab-work-log');
+    this.memoryTabKnowledgeBtn = this.panelEl.querySelector('#agent-tab-knowledge');
+    this.memoryContentEl = this.panelEl.querySelector('#agent-memory-content');
+    this.memoryCountEl = this.panelEl.querySelector('#agent-memory-count');
+    this.memoryAddBtn = this.panelEl.querySelector('#agent-memory-add-btn');
+    this.memoryAddFormContainerEl = this.panelEl.querySelector('#agent-memory-add-form');
     this.bindEvents();
     this.updateInputState();
   }
 
   private bindEvents(): void {
     this.panelEl?.querySelector('#agent-close-btn')?.addEventListener('click', () => this.hide());
+    this.panelEl?.querySelector('#agent-memory-btn')?.addEventListener('click', () => this.toggleMemoryDrawer());
+    this.panelEl?.querySelector('#agent-memory-close-btn')?.addEventListener('click', () => this.closeMemoryDrawer());
+    this.memoryTabWorkLogBtn?.addEventListener('click', () => this.switchMemoryTab('workLog'));
+    this.memoryTabKnowledgeBtn?.addEventListener('click', () => this.switchMemoryTab('knowledge'));
+    this.memoryAddBtn?.addEventListener('click', () => this.toggleAddKnowledgeForm());
 
     this.panelEl?.querySelectorAll('.agent-quick-chip').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -210,6 +287,10 @@ export class AgentPanel {
     this.panelEl?.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         e.preventDefault();
+        if (this.isMemoryDrawerOpen) {
+          this.closeMemoryDrawer();
+          return;
+        }
         this.hide();
       }
     });
@@ -236,6 +317,7 @@ export class AgentPanel {
     if (this.panelEl) this.panelEl.style.display = 'flex';
     document.body.classList.add('agent-panel-open');
     this.inputEl?.focus();
+    if (this.serverId) void this.fetchServerMemory();
     // 触发终端重新适配（面板展开后终端区域缩小，需要 refit）
     requestAnimationFrame(() => this.onLayoutChange?.());
   }
@@ -305,10 +387,18 @@ export class AgentPanel {
       case 'progress_extend':
         this.showProgressExtend(msg.message, msg.currentIteration, msg.newMax, msg.reason);
         break;
+      case 'memory_updated':
+        if (this.serverId) {
+          void this.fetchServerMemory();
+        }
+        break;
     }
   }
 
   private handleSend(): void {
+    if (this.isMemoryDrawerOpen) {
+      this.closeMemoryDrawer();
+    }
     const text = this.inputEl?.value || '';
     const selection = this.pendingTerminalSelection;
     if (!this.sendMessage(text, selection)) return;
@@ -340,11 +430,13 @@ export class AgentPanel {
     this.isAgentRunning = true;
     this.updateInputState();
 
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     this.wsSend?.(
       JSON.stringify({
         type: 'agent_start',
         message: outboundMessage,
         locale: getLocale(),
+        timezone,
       })
     );
     return true;
@@ -958,15 +1050,15 @@ export class AgentPanel {
       if (copyButton) this.setCodeActionButton(copyButton, 'content_copy', t('agent.codeCopy'));
 
       const fillButton = block.querySelector<HTMLButtonElement>('[data-code-action="fill"]');
-      if (!fillButton) return;
-      this.setCodeActionButton(fillButton, 'input', t('agent.codeFill'));
-
-      const target = this.getTerminalFillTarget?.();
-      fillButton.disabled = !target?.available;
-      const metaEl = block.querySelector<HTMLElement>('.agent-md-code-meta');
-      if (metaEl && target) {
-        metaEl.textContent = t('agent.codeTarget', { target: target.label });
-        metaEl.title = target.label;
+      if (fillButton) {
+        this.setCodeActionButton(fillButton, 'input', t('agent.codeFill'));
+        const target = this.getTerminalFillTarget?.();
+        fillButton.disabled = !target?.available;
+        const metaEl = block.querySelector<HTMLElement>('.agent-md-code-meta');
+        if (metaEl && target) {
+          metaEl.textContent = t('agent.codeTarget', { target: target.label });
+          metaEl.title = target.label;
+        }
       }
     });
   }
@@ -1029,7 +1121,381 @@ export class AgentPanel {
     this.contextEl = null;
     this.inputEl = null;
     this.sendBtn = null;
+    this.memoryDrawerEl = null;
+    this.memoryTabWorkLogBtn = null;
+    this.memoryTabKnowledgeBtn = null;
+    this.memoryContentEl = null;
+    this.memoryCountEl = null;
+    this.memoryAddBtn = null;
+    this.memoryAddFormContainerEl = null;
     this.isVisible = false;
     document.body.classList.remove('agent-panel-open');
+  }
+
+  // ==================== Server Unified Memory Management ====================
+
+  toggleMemoryDrawer(): void {
+    if (this.isMemoryDrawerOpen) {
+      this.closeMemoryDrawer();
+    } else {
+      this.openMemoryDrawer();
+    }
+  }
+
+  openMemoryDrawer(): void {
+    this.isMemoryDrawerOpen = true;
+    if (this.memoryDrawerEl) {
+      this.memoryDrawerEl.classList.remove('hidden');
+    }
+    void this.fetchServerMemory();
+  }
+
+  closeMemoryDrawer(): void {
+    this.isMemoryDrawerOpen = false;
+    if (this.memoryDrawerEl) {
+      this.memoryDrawerEl.classList.add('hidden');
+    }
+    this.closeAddKnowledgeForm();
+  }
+
+  switchMemoryTab(tab: 'workLog' | 'knowledge'): void {
+    this.activeMemoryTab = tab;
+    if (this.memoryTabWorkLogBtn && this.memoryTabKnowledgeBtn) {
+      if (tab === 'workLog') {
+        this.memoryTabWorkLogBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-[var(--accent)] text-[var(--accent)] transition-colors cursor-pointer';
+        this.memoryTabKnowledgeBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-transparent text-muted hover:text-primary transition-colors cursor-pointer';
+        this.memoryAddBtn?.classList.add('hidden');
+      } else {
+        this.memoryTabWorkLogBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-transparent text-muted hover:text-primary transition-colors cursor-pointer';
+        this.memoryTabKnowledgeBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-[var(--accent)] text-[var(--accent)] transition-colors cursor-pointer';
+        this.memoryAddBtn?.classList.remove('hidden');
+      }
+    }
+    this.closeAddKnowledgeForm();
+    this.renderMemoryContent();
+  }
+
+  private async fetchServerMemory(): Promise<void> {
+    if (!this.serverId) {
+      this.unifiedMemory = { workLogs: [], knowledge: [] };
+      this.renderMemoryContent();
+      return;
+    }
+    try {
+      const res = await fetch(`/api/servers/${this.serverId}/memory`);
+      if (res.ok) {
+        this.unifiedMemory = (await res.json()) as UnifiedServerMemory;
+      } else {
+        this.unifiedMemory = { workLogs: [], knowledge: [] };
+      }
+    } catch {
+      this.unifiedMemory = { workLogs: [], knowledge: [] };
+    }
+    this.renderMemoryContent();
+  }
+
+  private renderMemoryContent(): void {
+    if (!this.memoryContentEl) return;
+    const locale = getLocale() === 'en-US' ? 'en-US' : 'zh-CN';
+
+    if (this.memoryCountEl) {
+      if (this.activeMemoryTab === 'workLog') {
+        this.memoryCountEl.textContent = this.serverId
+          ? `(${this.unifiedMemory.workLogs.length}/${MAX_SERVER_WORK_LOGS})`
+          : '';
+      } else {
+        this.memoryCountEl.textContent = this.serverId
+          ? `(${this.unifiedMemory.knowledge.length}/${MAX_SERVER_KNOWLEDGE})`
+          : '';
+      }
+    }
+
+    if (!this.serverId) {
+      // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+      this.memoryContentEl.innerHTML = `
+        <div class="p-4 text-center text-muted text-xs">
+          ${t('agent.memoryDirectNotice')}
+        </div>
+      `;
+      return;
+    }
+
+    const userTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+    if (this.activeMemoryTab === 'workLog') {
+      if (this.unifiedMemory.workLogs.length === 0) {
+        // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+        this.memoryContentEl.innerHTML = `
+          <div class="p-4 text-center text-muted text-xs">
+            ${t('agent.workLogEmpty')}
+          </div>
+        `;
+        return;
+      }
+
+      const logsHtml = this.unifiedMemory.workLogs
+        .map((log) => {
+          const timeStr = formatTimestampWithRelative(log.created_at, Date.now(), locale, userTz);
+          return `
+            <div class="agent-memory-card p-2.5 rounded border border-[var(--border)] bg-[var(--bg-elevated)] flex flex-col gap-1.5" data-log-id="${log.id}">
+              <div class="flex items-center justify-between text-[11px]">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <span class="font-bold text-primary truncate" title="${escapeHtml(log.title)}">${escapeHtml(log.title)}</span>
+                  <span class="text-[10px] text-muted font-code shrink-0">${escapeHtml(timeStr)}</span>
+                </div>
+                <button type="button" class="agent-log-delete-btn text-muted hover:text-error transition-colors p-0.5 cursor-pointer shrink-0" data-id="${log.id}" title="${t('common.delete')}">
+                  <span class="material-symbols-outlined text-[15px]">delete</span>
+                </button>
+              </div>
+              <div class="agent-log-summary text-[11px] text-muted leading-relaxed cursor-pointer hover:text-text transition-colors select-text" title="${escapeHtml(log.summary)}">${escapeHtml(log.summary)}</div>
+            </div>
+          `;
+        })
+        .join('');
+
+      // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+      this.memoryContentEl.innerHTML = logsHtml;
+
+      this.memoryContentEl.querySelectorAll<HTMLElement>('.agent-log-summary').forEach((el) => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          el.classList.toggle('expanded');
+        });
+      });
+
+      this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-log-delete-btn').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const logId = Number(btn.dataset.id);
+          if (!logId || !this.serverId) return;
+          const ok = await confirmAction({
+            title: t('common.delete'),
+            message: t('agent.memoryDeleteConfirm'),
+            variant: 'danger',
+          });
+          if (!ok) return;
+
+          try {
+            const res = await fetch(`/api/servers/${this.serverId}/work-logs/${logId}`, {
+              method: 'DELETE',
+            });
+            if (res.ok) {
+              notify(t('agent.memoryDeleted'), { variant: 'success' });
+              void this.fetchServerMemory();
+            }
+          } catch {
+            /* ignore */
+          }
+        });
+      });
+      return;
+    }
+
+    // Knowledge Tab
+    if (this.unifiedMemory.knowledge.length === 0) {
+      // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+      this.memoryContentEl.innerHTML = `
+        <div class="p-4 text-center text-muted text-xs">
+          ${t('agent.knowledgeEmpty')}
+        </div>
+      `;
+      return;
+    }
+
+    const catBadges: Record<string, { label: string; tagClass: string; borderClass: string }> = {
+      credential: {
+        label: t('agent.categoryCredential'),
+        tagClass: 'bg-amber-500/15 text-amber-400',
+        borderClass: 'border-l-amber-500',
+      },
+      config: {
+        label: t('agent.categoryConfig'),
+        tagClass: 'bg-[var(--accent)]/15 text-[var(--accent)]',
+        borderClass: 'border-l-[var(--accent)]',
+      },
+      rule: {
+        label: t('agent.categoryRule'),
+        tagClass: 'bg-[var(--accent-secondary)]/15 text-[var(--accent-secondary)]',
+        borderClass: 'border-l-[var(--accent-secondary)]',
+      },
+      note: {
+        label: t('agent.categoryNote'),
+        tagClass: 'bg-emerald-500/15 text-emerald-400',
+        borderClass: 'border-l-emerald-500',
+      },
+    };
+
+    const knowledgeHtml = this.unifiedMemory.knowledge
+      .map((k) => {
+        const meta = catBadges[k.category] || catBadges.note;
+        const isSecret = k.category === 'credential' || isSensitiveKeyOrValue(k.key, k.value);
+        const isRevealed = this.revealedSecretIds.has(k.id);
+        const displayValue = isSecret && !isRevealed ? '••••••••••••••••' : k.value;
+
+        return `
+          <div class="agent-memory-card p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] flex flex-col gap-1.5 select-text" data-knowledge-id="${k.id}">
+            <div class="flex items-center justify-between text-[11px]">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase ${meta.tagClass}">${escapeHtml(meta.label)}</span>
+                <span class="font-mono font-bold text-primary truncate select-all">${escapeHtml(k.key)}</span>
+              </div>
+              <div class="flex items-center gap-1 shrink-0">
+                ${
+                  isSecret
+                    ? `
+                  <button type="button" class="agent-secret-toggle-btn text-muted hover:text-primary transition-colors p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer flex items-center justify-center" data-id="${k.id}" title="${isRevealed ? t('agent.hideSecret') : t('agent.revealSecret')}">
+                    <span class="material-symbols-outlined text-[15px]">${isRevealed ? 'visibility_off' : 'visibility'}</span>
+                  </button>
+                `
+                    : ''
+                }
+                <button type="button" class="agent-knowledge-copy-btn text-muted hover:text-primary transition-colors p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer flex items-center justify-center" data-value="${escapeHtml(k.value)}" title="${t('agent.codeCopy')}">
+                  <span class="material-symbols-outlined text-[15px]">content_copy</span>
+                </button>
+                <button type="button" class="agent-knowledge-delete-btn text-muted hover:text-error transition-colors p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer flex items-center justify-center" data-id="${k.id}" title="${t('common.delete')}">
+                  <span class="material-symbols-outlined text-[15px]">delete</span>
+                </button>
+              </div>
+            </div>
+            <div class="text-[12px] font-mono text-primary/90 bg-[var(--bg-hover)]/30 rounded-r px-2.5 py-1.5 break-all select-all leading-relaxed border-l-2 ${meta.borderClass}">${escapeHtml(displayValue)}</div>
+          </div>
+        `;
+      })
+      .join('');
+
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    this.memoryContentEl.innerHTML = knowledgeHtml;
+
+    this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-secret-toggle-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const kId = Number(btn.dataset.id);
+        if (this.revealedSecretIds.has(kId)) {
+          this.revealedSecretIds.delete(kId);
+        } else {
+          this.revealedSecretIds.add(kId);
+        }
+        this.renderMemoryContent();
+      });
+    });
+
+    this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-knowledge-copy-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const val = btn.dataset.value || '';
+        await copyTextToClipboard(val);
+        notify(t('agent.copySuccess'), { variant: 'success' });
+      });
+    });
+
+    this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-knowledge-delete-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const kId = Number(btn.dataset.id);
+        if (!kId || !this.serverId) return;
+        const ok = await confirmAction({
+          title: t('common.delete'),
+          message: t('agent.memoryDeleteConfirm'),
+          variant: 'danger',
+        });
+        if (!ok) return;
+
+        try {
+          const res = await fetch(`/api/servers/${this.serverId}/knowledge/${kId}`, {
+            method: 'DELETE',
+          });
+          if (res.ok) {
+            notify(t('agent.memoryDeleted'), { variant: 'success' });
+            void this.fetchServerMemory();
+          }
+        } catch {
+          /* ignore */
+        }
+      });
+    });
+  }
+
+  toggleAddKnowledgeForm(): void {
+    if (!this.memoryAddFormContainerEl) return;
+    if (this.memoryAddFormContainerEl.classList.contains('hidden')) {
+      this.openAddKnowledgeForm();
+    } else {
+      this.closeAddKnowledgeForm();
+    }
+  }
+
+  openAddKnowledgeForm(): void {
+    if (!this.memoryAddFormContainerEl) return;
+    this.memoryAddFormContainerEl.classList.remove('hidden');
+
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    this.memoryAddFormContainerEl.innerHTML = `
+      <form id="agent-add-knowledge-form" class="space-y-2">
+        <div class="flex gap-2">
+          <select id="agent-knowledge-category" class="terminal-input text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] text-primary">
+            <option value="credential">${t('agent.categoryCredential')}</option>
+            <option value="config">${t('agent.categoryConfig')}</option>
+            <option value="rule">${t('agent.categoryRule')}</option>
+            <option value="note" selected>${t('agent.categoryNote')}</option>
+          </select>
+          <input id="agent-knowledge-key" type="text" placeholder="${t('agent.knowledgeKey')}" class="terminal-input flex-1 text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code text-primary" required maxlength="64" />
+        </div>
+        <div>
+          <textarea id="agent-knowledge-value" rows="2" placeholder="${t('agent.knowledgeValue')}" class="terminal-input w-full text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code resize-none text-primary" required maxlength="512"></textarea>
+        </div>
+        <div class="flex justify-end gap-2">
+          <button type="button" id="agent-knowledge-cancel-btn" class="px-2 py-0.5 text-xs text-muted hover:text-primary cursor-pointer">${t('agent.memoryCancel')}</button>
+          <button type="submit" id="agent-knowledge-submit-btn" class="cyber-button px-3 py-0.5 text-xs font-bold text-white bg-[var(--accent)] cursor-pointer">${t('agent.memorySave')}</button>
+        </div>
+      </form>
+    `;
+
+    const form = this.memoryAddFormContainerEl.querySelector<HTMLFormElement>('#agent-add-knowledge-form');
+    const cancelBtn = this.memoryAddFormContainerEl.querySelector<HTMLButtonElement>('#agent-knowledge-cancel-btn');
+    cancelBtn?.addEventListener('click', () => this.closeAddKnowledgeForm());
+
+    form?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await this.handleSaveKnowledge();
+    });
+
+    const keyInput = this.memoryAddFormContainerEl.querySelector<HTMLInputElement>('#agent-knowledge-key');
+    keyInput?.focus();
+  }
+
+  closeAddKnowledgeForm(): void {
+    if (!this.memoryAddFormContainerEl) return;
+    this.memoryAddFormContainerEl.classList.add('hidden');
+    this.memoryAddFormContainerEl.replaceChildren();
+  }
+
+  private async handleSaveKnowledge(): Promise<void> {
+    if (!this.serverId || !this.memoryAddFormContainerEl) return;
+    const catSelect = this.memoryAddFormContainerEl.querySelector<HTMLSelectElement>('#agent-knowledge-category');
+    const keyInput = this.memoryAddFormContainerEl.querySelector<HTMLInputElement>('#agent-knowledge-key');
+    const valInput = this.memoryAddFormContainerEl.querySelector<HTMLTextAreaElement>('#agent-knowledge-value');
+
+    const category = catSelect?.value || 'note';
+    const key = keyInput?.value || '';
+    const value = valInput?.value || '';
+
+    const normalized = normalizeKnowledgeInput({ category, key, value });
+    if (!normalized.ok) return;
+
+    try {
+      const res = await fetch(`/api/servers/${this.serverId}/knowledge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(normalized.value),
+      });
+
+      if (res.ok) {
+        notify(t('agent.memorySaved'), { variant: 'success' });
+        this.closeAddKnowledgeForm();
+        void this.fetchServerMemory();
+      }
+    } catch {
+      /* ignore */
+    }
   }
 }
