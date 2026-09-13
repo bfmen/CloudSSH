@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.5] - 2026-09-13
+
+### Added
+
+- **AI Agent 与 SFTP 抽屉互斥与会话联动**：
+  - 打开 AI 助手时自动收起 SFTP 面板，打开 SFTP 时亦自动收起 AI 助手；终端选区一键「向 AI 助手提问」时同样自动收起 SFTP，杜绝两层侧边抽屉打架堆叠。
+  - 切换标签页时自动协调收起前序会话抽屉，切回时由用户按需展开对应会话上下文；关闭标签页时原子销毁 DOM 节点。
+
+### Changed
+
+- **AI Agent 面板全面重构为全高侧边抽屉（对齐 SFTP 设计系统）**：
+  - 彻底移出原局部终端容器（消除对终端的挤压与 xterm 强制重排抖动），升级为挂载在 `document.body` 的屏幕全高固定抽屉（`fixed top-0 right-0 h-full z-[85] shadow-2xl`），宽度规范为 `min(clamp(420px, 40vw, 600px), 100vw)`。
+  - 消除顶栏、多标签栏、状态栏对 AI 面板的高度侵占，中间消息滚动区（`#agent-messages`）纵向可视高度在 1080p 屏幕下翻倍扩展至 750px+，大段运维排障报告、配置对比与脚本输出一览无余，彻底消除频繁滚屏查看的局促体验。
+  - 采用平滑滑入滑出动效（`transition-transform duration-300 ease-in-out` + `translateX(100%)` ↔ `translateX(0)`），配合阴影与边框，视觉与交互心智与 SFTP 高度对称统一。
+  - 移动端（≤768px）原有顶部安全区、全屏覆盖与「返回终端」返回按钮等交互规范 100% 稳定保持。
+
+## [2.2.4] - 2026-09-13
+
+### Fixed
+
+- **深度思考/推理模型单次 Token 截断防护与未完成思考防泄露**：
+  - 流式解析（`handleStreamingResponse`）捕获服务端的真实 `choice.finish_reason`，当发生单次 Token 上限截断（`finish_reason === 'length'`）时，严格切断将未完成推导草稿（`reasoningText`）当成正文发送给前端的错误回退逻辑，彻底杜绝聊天面板弹出未完结内部英文推导草稿的问题。
+- **无感自动接续（Auto-Continuation）机制**：
+  - Agent 控制循环（`runLoop`）精准感知 `finish_reason === 'length'` 截断事件。在尚未产出工具调用的情况下，自动进行有界内部接续（上限 2 次），并在消息历史中严格维护 `user`/`assistant` 角色交替（注入占位与明确行动指引），提示大模型迅速进入工具调用或输出简明结论。
+  - 前端平滑维持“思考中...”指示，大模型在下一轮自动产出 `execute_command` 并推进命令执行，彻底告别必须由用户手动输入“继续”唤醒流程的繁琐交互；连续多次超限则安全退出并给出任务拆解建议，杜绝无限死循环。
+
+### Changed
+
+- **系统提示词增加深度思考与行动优先准则**：
+  - `SYSTEM_PROMPT` 补充专属《深度思考与行动准则》，约束推理模型推导保持高度凝练、紧扣核心目标并以“行动优先”原则果断调用相应工具，从提示词源头显著压缩思维链长度，大幅降低触碰单次 4096 Token 上限的概率。
+
 ## [2.2.3] - 2026-09-10
 
 ### Added
